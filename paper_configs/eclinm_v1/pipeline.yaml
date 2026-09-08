@@ -1,0 +1,280 @@
+# KITE-CRM locked pipeline configuration — release v1.0-eclinm
+#
+# Single source of truth for preprocessing, model construction, weights and
+# operating thresholds as reported in the manuscript. Values that cannot be
+# independently recovered from the local artefacts are
+# explicitly marked below; they must not be cited as independently verified.
+#
+# Weight hashes: paper_configs/eclinm_v1/weights_manifest.csv
+# Network identity: the implementation and release manifest in this repository
+
+release: v1.0-eclinm
+manuscript: eclinm-D-26-02033
+
+# ---------------------------------------------------------------- acquisition
+input:
+  modality: CT
+  phase: corticomedullary            # CMP only — the single-phase limitation
+  phases_used: 1
+  orientation: axial
+  note: >
+    No other contrast phase is consumed by any deployed module. Cross-phase
+    enhancement dynamics are not modelled. See ARCHITECTURE.md section 4.
+
+# --------------------------------------------------------------- segmentation
+segmentation:
+  # ONE network, two uses. A single LightM-UNet forward pass produces both the
+  # kidney/lesion masks shown to radiologists AND the decoder feature pyramid
+  # consumed by Tasks 2-4. There is no second segmentation network in the
+  # locked pipeline.
+
+  deployed:
+    role: >
+      Kidney and lesion masks; overlays displayed to radiologists in the reader
+      study and in the prospective randomized implementation study; and — via
+      the decoder hook below — the 3D feature pyramid consumed by Tasks 2-4.
+      Confirmed by the study authors as the deployed segmentation network.
+    name: LightM-UNet
+    backbone: Mamba / selective state space
+    framework: nnU-Net v2
+    trainer: nnUNetTrainerLightMUNet
+    plans: nnUNetPlans
+    configuration: 3d_fullres
+    fold: 0
+    patch_size: [80, 128, 128]
+    implementation: segmentation/LightM-UNet-master/nets/LightMUNet.py
+    construction:
+      spatial_dims: 3
+      init_filters: 32
+      in_channels: 1
+      out_channels: 3
+    weight: nnUNetTrainerLightMUNet__nnUNetPlans__3d_fullres/fold0/checkpoint_best.pth
+    sha256: 92af277bff3778f32532bc09f502fc9f591ab7250535aae97124645460c2619a
+    status: locked/deployed
+    label_semantics:
+      1: kidney
+      2: lesion
+    training_cohort:
+      dataset: Dataset411_Kidney
+      n: 655
+      class_counts:
+        benign: 429
+        malignant: 226
+      spacing: [1.0, 1.0, 1.0]
+      normalization: CTNormalization
+      batch_size: 4
+      note: >
+        Author-provided attachment records a 655-case segmentation training cohort,
+        comprising 429 benign and 226 malignant cases. This is the training-cohort
+        count to use for the final release.
+    disk_verification: >
+      362 parameter tensors; convInit / down_layers / up_layers / up_samples /
+      conv_final; 189 Mamba/SSM tensors (mamba.A_log, mamba.D, mamba.in_proj,
+      mamba.conv1d, mamba.x_proj).
+
+    feature_hook:
+      role: >
+        Source of the 3D decoder feature pyramid consumed by Tasks 2-4. Same
+        network, same forward pass as the overlays above — the volumetric
+        representation is reused, not recomputed.
+      file: segmentation/LightM-UNet-master/nets/LightMUNet.py
+      lines: [213, 284]                 # __init__ hook dict; decode() capture
+      capture_point: >
+        Top of the decode() loop, BEFORE up(x). hook[0] is therefore the
+        bottleneck tensor and hook[1..2] are the first two decoder stages.
+      dumped_by: segmentation/feature_extraction/dump_decoder_features.py
+      dump_trigger: nnunetv2/inference/predict_from_raw_data.py lines 474-475
+      outputs:                          # hook index -> npz key -> LE argument
+        hook0: {npz_key: feat1, le_arg: feat0, shape: [256, 10, 16, 16]}
+        hook1: {npz_key: feat2, le_arg: feat1, shape: [128, 20, 32, 32]}
+        hook2: {npz_key: feat3, le_arg: feat2, shape: [64, 40, 64, 64]}
+      key_offset_note: >
+        The npz keys are 1-based (feat1..feat3) while LE.forward takes
+        (feat0, feat1, feat2). The dataloader maps them explicitly; the offset
+        is preserved for byte-compatibility with the archived .npz files.
+
+# ------------------------------------------------------------------ task 1
+task1_abnormality:
+  question: kidney-level normal (0) vs abnormal (1)
+  model:
+    library: monai.networks.nets.DenseNet121
+    spatial_dims: 3
+    in_channels: 1
+    out_channels: 2
+  preprocessing:
+    hu_window: [-1200, 600]           # lumTrans -> uint8
+    laterality_split_x: 256           # volume split into left / right kidney
+    crop: kidney bbox, xy centre +/- 64
+    clip_shape: [Z, 128, 128]
+    resize: [32, 128, 128]
+    intensity: divide by 255 -> [0, 1]
+  training:
+    optimizer: AdamW
+    lr: 1.0e-4
+    weight_decay: 1.0e-5
+    scheduler: CosineAnnealingLR
+    batch_size: 6
+    epochs: 50
+    loss: CrossEntropy with inverse-frequency class weights
+    amp: true
+    selection: best validation AUROC
+  weight: task1_ckpt/best.pt
+  sha256: c37a7ee5f1501aa6442984fc20fb26c21b5bfca16bcf83616b71a77255b9a9e3
+  status: locked/deployed
+  status_note: >
+    Author-confirmed locked/deployed Task-1 checkpoint. The historical source
+    directory name is retained only in the weight package for provenance.
+  threshold: 0.5
+  threshold_note: >
+    No published Task 1 operating threshold. 0.5 is the default binarisation
+    used for descriptive reporting only; it was not locked on any cohort.
+
+# ------------------------------------------------------------------- gating
+cystic_solid_gating:
+  name: standalone_hu_rule_gating
+  implementation: standalone deterministic HU-rule model
+  software_registration_number: 2024SR1383073
+  dimensionality: 3D lesion-volume rule
+  implementation_path: cystic_solid_gating_gate_v1.0/gate_cystic_solid_cmp.py
+  config_path: paper_configs/eclinm_v1/gating_config.yaml
+  input:
+    image: corticomedullary-phase CT in HU
+    lesion_mask: LightM-UNet label 2
+  outputs: [cystic, solid, none]
+  hu_threshold: 20.0
+  cyst_fraction_threshold: 0.5
+  learned_checkpoint: none
+  status: locked/deployed
+
+# -------------------------------------------------------------- tasks 2 to 4
+classification_tasks2_4:
+  feature_source:
+    network: LightM-UNet (nnU-Net v2 + Mamba)
+    via: segmentation.deployed.feature_hook
+    note: >
+      Tasks 2-4 are not image classifiers. Their input is the 3D decoder
+      feature pyramid of the deployed segmentation network — the same forward
+      pass that produced the mask. No image section is selected at any point.
+  model:
+    class: LE
+    file: classification_tasks2_4/model_LE.py
+    parameters: 10569666             # unified class LE 3D FPN, trainable params, 2-class
+    state_dict_numel: 10570634       # incl. BatchNorm buffers (running_mean/var/num_batches)
+    generation: unified_tasks2_4
+    architecture_note: >
+      Tasks 2–4 share one formulation: LightM-UNet (nnU-Net v2) decoder-hook
+      features feed the 3D FPN/class LE classifier. Task-specific checkpoints
+      are separate, but the upstream feature source and FPN formulation are
+      unified across all three tasks. Task 1 separately uses the LightM-UNet
+      kidney output as a volumetric clip for MONAI 3D DenseNet-121.
+    inputs: [feat0, feat1, feat2]
+    blocks: [SPP, top-down FPN fusion]              # no SELayer, no dense Block (both Gen1)
+    pooling: F.avg_pool3d(kernel=8)
+    head: Linear(10240 -> 1024) -> Linear(1024 -> 2)
+    pathology_5class_variant:
+      dir: external_weight_package/pathology_variant
+      class: LE5
+      parameters: 10573829          # trainable
+      state_dict_numel: 10574862    # incl. BN buffers
+      difference: >
+        Adds a projection conv3d(32,32,1) before pooling and a 5-class head
+        (linear2 1024 -> 5) for the pathology five-class column in the supplied Task 2 workbook
+        (labels 1-5; label 0 "normal" is supplied by Task 1).
+    heads_per_model: 1
+    joint_optimisation: false
+    note: >
+      Tasks 2, 3 and 4 are separately trained models sharing this architecture,
+      each with its own checkpoint. They are not three heads of one network.
+  training:
+    optimizer: SGD
+    lr: 0.05
+    momentum: 0.9
+    weight_decay: 5.0e-4
+    scheduler: multi-step decay
+    batch_size: 32
+    epochs: 200
+    selection: best validation AUROC
+
+  task2_malignancy:
+    question: lesion-level benign vs malignant
+    weight: external_weight_package/task2_deployed_Gen2_best.pt
+    sha256: f57e5e637af55ae421ca8d5ac69c35b1b6b90b0a1a8e87f55420a08e95075f58
+    status: locked/deployed
+    weight_note: >
+      Task-2 uses the unified LightM-UNet decoder-hook + 3D FPN/class LE
+      formulation. The official supplied workbook remains the provenance source
+      for case-level probabilities.
+    threshold: 0.586442888
+    decision_rule: probability >= threshold
+    probability_rounding: none_before_thresholding
+    threshold_provenance: author-confirmed deployment threshold
+    threshold_note: >
+      Apply the threshold to the unrounded probability. This release does not
+      infer or add a threshold-selection rule beyond the author-confirmed
+      deployment value.
+
+  task3_subtype:
+    question: ccRCC vs other malignant subtype
+    weight: external_weight_package/task3_best.pt
+    sha256_prefix: 0e92d3e2c5a655d0
+    split: official xlsx Training / Validation
+    status: locked/deployed
+    status_note: >
+      Author-confirmed locked/deployed Task-3 checkpoint; the package filename
+      reflects its historical source directory, not a reproduction status.
+    role: secondary characterisation output, not a stand-alone management criterion
+
+  task4_grade:
+    question: ccRCC high-grade (3-4) vs low-grade (1-2)
+    weight: external_weight_package/task4_best.pt
+    sha256_prefix: 4001630f3c7b90d6
+    split: official xlsx Training / Validation
+    status: locked/deployed
+    status_note: >
+      Author-confirmed locked/deployed Task-4 checkpoint; the package filename
+      reflects its historical source directory, not a reproduction status.
+    role: secondary characterisation output, not a stand-alone management criterion
+
+  excluded_weights:
+    - path: external_weight_package/task3_FINAL_allmerged.pt
+      reason: trained on merged Training+Validation; resubstitution only
+    - path: external_weight_package/task4_FINAL_allmerged.pt
+      reason: trained on merged Training+Validation; resubstitution only
+
+# ------------------------------------------------------------- explainability
+explainability:
+  method: Grad-CAM
+  layer: last convolutional layer of the classification branch
+  role: visual attention aid only
+  not_used_for: [threshold selection, probability recalibration, treatment decision rules]
+
+# ------------------------------------------------------------- reproduction env
+environment:
+  python: 3.9.19
+  pytorch: 2.8.0+cu128
+  torchvision: 0.23.0
+  cuda: 12.8
+  original_deployment_repository: https://github.com/CHANGHAI-AILab/KITE-CRM-final
+  core_code_baseline: ca3648a702efb762904f0cc1c603f6df69902333
+  corrected_final_release_tag: v1.0-eclinm
+  reader_prospective_weights_match_locked_deployed: true
+  note: >
+    Original training used NVIDIA RTX 3090 ×2 (author-confirmed), driver 535.104.05,
+    bare metal (no container), Ubuntu 20.04 / kernel 5.15.0. The reader-study
+    and prospective-study checkpoints have the same SHA256 hashes as the
+    corresponding locked/deployed checkpoints in weights_manifest.csv.
+
+# ------------------------------------------------- sensitivity arms (not deployed)
+sensitivity_models:
+  reference: post hoc complete-pair architecture-sensitivity analysis; modeling scripts are included in analysis/2D_sensitivity_modeling/ (restricted data and checkpoints are not included)
+  arms:
+    - name: 2D_DenseNet121_maxsection_task2
+      input: largest-area axial lesion section, WL 40 / WW 400, bbox-centred crop, 224x224
+      seeds: [0, 1, 2]
+      threshold: 0.4648               # Youden on internal validation, 3-seed mean
+    - name: 2D_DenseNet121_task1
+      input: central 3-slice mean of the kidney clip, resized 224, ImageNet normalisation
+      threshold: 0.2578               # Youden on validation
+  constraint: >
+    Sensitivity models were never deployed, never used to set any locked
+    threshold, and never evaluated on the reader or prospective cohorts.

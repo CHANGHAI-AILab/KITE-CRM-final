@@ -1,0 +1,26 @@
+# KITE-CRM v1.0-eclinm — reference REPRODUCTION environment (not the original
+# training stack). The original deployed LightM-UNet was trained under
+# torch 2.0.1+cu117 / MONAI 1.3.0 / nnU-Net v2 2.1.1 / mamba-ssm 1.1.4;
+# see ENVIRONMENT.md for the original and reference environments.
+#
+# The decoder feature hook is the two-line patch to
+# segmentation/LightM-UNet-master/nets/LightMUNet.py described in
+# segmentation/feature_extraction/dump_decoder_features.py
+
+torch==2.8.0
+torchvision==0.23.0
+monai==1.3.0
+SimpleITK==2.3.1
+nibabel==5.2.1
+numpy==1.26.4
+pandas==2.2.2
+scipy==1.13.1
+scikit-learn==1.5.1
+openpyxl==3.1.5
+PyYAML==6.0.1
+tqdm==4.66.4
+
+# LightM-UNet branch only (segmentation/LightM-UNet-master/).
+# Requires a CUDA toolchain; skip if you are not training the Mamba backbone.
+# mamba-ssm==1.2.0
+# causal-conv1d==1.2.0

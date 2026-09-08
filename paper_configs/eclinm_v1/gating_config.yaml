@@ -1,0 +1,19 @@
+name: standalone_hu_rule_gating
+version: 1.0
+status: locked/deployed
+software_registration_number: 2024SR1383073
+phase: corticomedullary
+input:
+  image: full-size CMP CT in Hounsfield units
+  lesion_mask: LightM-UNet label 2
+labels:
+  0: background
+  1: kidney
+  2: lesion
+parameters:
+  hu_threshold: 20.0
+  cyst_fraction_threshold: 0.5
+outputs: [cystic, solid, none]
+implementation: cystic_solid_gating_gate_v1.0/gate_cystic_solid_cmp.py
+learned_checkpoint: none
+override_policy: CLI overrides are sensitivity-analysis settings only
